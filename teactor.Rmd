@@ -1,0 +1,295 @@
+---
+title: "Tecator"
+substitle: "Fat Prediction"
+author: Ra'Shawn Howard
+output: html_notebook
+---
+
+# Data Description
+Infrared (IR) spectroscopy technology is used to determine the chemical makeup of a substance. The device measures the absorbance of the sample at each individual frequency. This series of measurements creates a spectrum profile which can then be used to determine the chemical makeup of the sample material. A Tecator Infratec Food and Feed Analyzer intrument was used to analyze 215 samples of meat across 100 frequencies. In addition to an IR profile, analytical chemistry determined the percent fat for each sample.
+
+# Goals of Analysis
+If we can establish a predictive relationship between IR spectrum and fat content, then food scientist could predict a sample's fat content, then food scientist could predict a sample's fat content with IR instead of analytical chemistry. This could provide cost savings, since analytical chemistry is  a more expensive, time-consuming process.
+
+# Methodology
+The data was split into a testing and training set, and different preprocessing methods were done. \
+The predictors are highly correlated, so PCA was used to reduce the dimension of the predictor space. \
+Cross-validation was done to find the optimal value of the tuning parameters for models that required this. \
+The different types of models that fit the data were: bagged trees, boosted trees, cubist, linear regression, decision trees, MARS, neural networks, KNN, random forest, and SVM. \
+The neural network model performed the best on the training data with an RMSE of .85088724 and a standard error of 0.03248912, followed by the cubist model.
+```{r}
+library(tidymodels)
+library(tidyverse)
+library(caret)
+
+data(tecator)
+
+absorp %>% as_tibble() -> absorp
+
+endpoints %>% as_tibble() -> endpoints
+
+endpoints %>% 
+  rename(percent_moister = V1,
+         fat = V2,
+         protein = V3) -> endpoints
+
+endpoints %>% 
+  dplyr::select(fat) %>% 
+  bind_cols(absorp) -> train
+
+# randomly split data using stratified random sampling, This will keep the distribution of the response
+set.seed(2021)
+split <- initial_split(train, strata = fat)
+train <- training(split)
+test  <- testing(split)
+```
+
+# EDA
+```{r}
+train %>% 
+  ggplot(aes(fat)) +
+  geom_histogram()
+
+max(train$fat)/min(train$fat) # significant skew @khun ratio > 20, use stratified sampling to keep underlying distribution
+
+GGally::ggcorr(train) # Very High Correlations PCA or PLS will be a good idea for linear models
+```
+
+# Linear Models
+
+## Pre-Processing 
+```{r}
+rec_pca <- recipe(fat~., data = train) %>% 
+  step_BoxCox(all_numeric_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_scale(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(), num_comp = 5)
+
+rec_pls <- recipe(fat~., data = train) %>% 
+  step_BoxCox(all_numeric_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_scale(all_numeric_predictors()) %>% 
+  step_pls(all_numeric_predictors(), outcome = "fat", num_comp = 5)
+
+rec_reg <- recipe(fat~.,data = train)
+
+preproc <- list(pca = rec_pca, pls = rec_pls)
+```
+
+## Resamples
+```{r}
+set.seed(2021)
+folds <- bootstraps(train)
+```
+
+## Linear Model Specifications
+```{r}
+lm_spec <- linear_reg() %>% 
+  set_engine("lm")
+
+ridge_spec <- linear_reg(mixture = 0, penalty = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+
+lasso_spec <- linear_reg(mixture = 1, penalty = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+
+ennet_spec <- linear_reg(mixture = tune(), penalty = tune()) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("regression")
+```
+
+```{r}
+library(plot3D)
+
+rec_pca %>% 
+  prep() %>% 
+  juice() -> temp_pca_data
+
+x <- temp_pca_data$PC1
+y <- temp_pca_data$PC2
+z <- temp_pca_data$fat
+
+lin_mod <- lm(z~x+y)
+
+grid.lines = 40
+x.pred <- seq(min(x), max(x), length.out = grid.lines)
+y.pred <- seq(min(y), max(y), length.out = grid.lines)
+xy <- expand.grid( x = x.pred, y = y.pred)
+z.pred <- matrix(predict(lin_mod, newdata = xy), 
+                 nrow = grid.lines, ncol = grid.lines)
+
+fitpoints <- predict(lin_mod)
+
+scatter3D(x, y, z, pch = 19, cex = 1,colvar = NULL, col="red", 
+          theta = 10, phi = 30, bty="b",
+          xlab = "PC1", ylab = "PC2", zlab = "Fat",  
+          surf = list(x = x.pred, y = y.pred, z = z.pred,  
+                      facets = TRUE, fit = fitpoints, col=ramp.col (col = c("dodgerblue3","seagreen2"), n = 300, alpha=0.9),
+                      border="black"), main = "Fat Prediction Using PCA")
+```
+
+```{r}
+lm_models <- workflow_set(preproc, models = list(lm = lm_spec, 
+                                        ridge = ridge_spec,
+                                        lasso = lasso_spec,
+                                        net = ennet_spec), cross = TRUE)
+```
+
+```{r}
+lm_models <- lm_models %>% 
+  workflow_map("tune_grid",
+             seed = 1101, verbose = TRUE,
+             resamples = folds, grid = 20)
+```
+
+```{r}
+lm_models %>% rank_results(rank_metric = "rmse")
+
+autoplot(lm_models,metric = "rmse") # need more models to get more colors
+# best RMSE for linear models is 3.3816745 with R^2 0.9261585
+```
+
+# Nonlinear Models
+
+## PreProcess
+```{r}
+non_lm_rec_1 <- recipe(fat~.,data = train) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_scale(all_numeric_predictors())
+
+non_lm_rec_2 <- recipe(fat~.,data = train) %>% 
+  step_BoxCox(all_numeric_predictors()) %>% 
+  step_center(all_numeric_predictors()) %>% 
+  step_scale(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors(), threshold = 0.9)
+
+preproc_nl <- list(non_lm_rec_1,non_lm_rec_2)
+```
+
+## Non-linear Model Specs
+```{r}
+knn_spec <- nearest_neighbor(mode = "regression", 
+                             neighbors = tune::tune()) %>% 
+  set_engine("kknn")
+
+mars_spec <- mars(mode = "regression", 
+                  num_terms = tune::tune(), 
+                  prod_degree = tune::tune()) %>% 
+  set_engine("earth")
+
+nnet_spec <- parsnip::mlp(mode = "regression", 
+                          hidden_units = 5, 
+                          penalty = tune::tune(),
+                          epochs = 500) %>% 
+  set_engine("nnet")
+
+svm_spec <- svm_rbf(mode = "regression",
+                    cost = tune::tune(),
+                    rbf_sigma = tune::tune(),
+                    margin = tune::tune()) %>% 
+  set_engine("kernlab")
+```
+
+
+```{r}
+non_linear_models <- workflow_set(preproc_nl, models = list(knn_spec,
+                                                          mars_spec,
+                                                          nnet_spec,
+                                                          svm_spec), cross = TRUE)
+```
+
+```{r}
+non_linear_models <- non_linear_models %>% 
+  workflow_map("tune_grid",
+               seed=1113, verbose = TRUE,
+               resamples = folds, grid = 20)
+
+non_linear_models %>% rank_results(rank_metric = "rmse") # Single Layer Nueral Network Did the best with mean RMSE of .85088724 and a mean R^2 of .99540691
+```
+
+# Tree/Rule-Models
+```{r}
+tree_rec <- recipe(fat~., data = train)
+preproc <- list(tree_rec)
+```
+
+```{r}
+tree_spec <- decision_tree(mode = "regression",
+              cost_complexity = tune::tune(),
+              tree_depth = tune::tune()) %>% 
+  set_engine("rpart")
+
+cube_spec <- rules::cubist_rules(mode = "regression", 
+                    committees = 50,
+                    neighbors = tune::tune(),
+                    max_rules = tune::tune()) %>% 
+  set_engine("Cubist")
+
+forest_spec <- rand_forest(mode = "regression",
+            mtry = tune::tune(),
+            trees = 1000, 
+            min_n = tune::tune()) %>% 
+  set_engine("ranger")
+
+bag_tree_spec <- baguette::bag_tree(mode = "regression",
+                   cost_complexity = tune::tune(),
+                   tree_depth = tune::tune()) %>% 
+  set_engine("rpart")
+
+boost_tree_spec <- boost_tree(mode = "regression", 
+           mtry = tune::tune(),
+           trees = 1000,
+           learn_rate = tune::tune(),
+           tree_depth = tune::tune()) %>% 
+  set_engine("xgboost")
+
+tree_models_list <- list(tree_spec,
+                         cube_spec,
+                         forest_spec,
+                         bag_tree_spec,
+                         boost_tree_spec)
+```
+
+```{r}
+tree_models <- workflow_set(preproc = preproc, 
+                            models = tree_models_list,
+                            cross = TRUE)
+
+tree_models <- tree_models %>% 
+  workflow_map("tune_grid",
+               seed = 1113, verbose = TRUE,
+               resamples = folds, grid = 20)
+
+tree_models %>% rank_results(rank_metric = "rmse")
+
+non_linear_models %>% 
+  bind_rows(tree_models) %>% 
+  bind_rows(lm_models) %>% 
+  autoplot(metric = "rmse") + 
+  facet_wrap(~model, scales = "free") + 
+  theme(legend.position = "none") +
+  ggtitle("Bootstrap resamples average RMSE")
+
+```
+
+
+# Model Results on test set
+```{r}
+# Extract best model
+mlp_fit <- non_linear_models %>% 
+  bind_rows(tree_models) %>% 
+  bind_rows(lm_models) %>% 
+  extract_workflow("recipe_1_mlp")
+
+mlp_fit %>% 
+  select_best(metric = "rmse") -> best_mlp_param
+
+finalize_workflow(mlp_fit,best_mlp_param) -> mlp_final_wf
+
+test_results <- mlp_final_wf %>% 
+  last_fit(split)
+
+test_results %>% collect_metrics("rmse")
+```
